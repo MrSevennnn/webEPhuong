@@ -12,6 +12,7 @@
     gtag('js', new Date());
     gtag('config', 'G-CZ43CR3KWN', { anonymize_ip: true });
   </script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <title>Timemark — Chấm công</title>
   <style>
     :root{color-scheme:dark;--green:#00b14f;--blue:#1976d2;--ink:#eef3f8;--muted:#9ba8b6;--panel:#111821;--line:rgba(255,255,255,.09)}
@@ -77,6 +78,11 @@
   (()=>{
     'use strict';
     const W=768,H=1024,LS='timemark_clone_v1';
+    const SUPABASE_URL='https://htmkdjgvcmximwkuaswn.supabase.co';
+    const SUPABASE_PUBLISHABLE_KEY='sb_publishable_kINJgzcNn3-sSkVjA6PLZQ_SVcxT37v';
+    const STORAGE_BUCKET='timemark-photos';
+    const supabaseClient=window.supabase&&!SUPABASE_URL.includes('YOUR_')&&!SUPABASE_PUBLISHABLE_KEY.includes('YOUR_')
+      ?window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY):null;
     const defaults={in:{accent:'#00B14F',badge:'Vào ca',address:'Võ Nguyên Giáp, P. An Biên, Thành Phố\nHải Phòng'},out:{accent:'#1976D2',badge:'Tan ca',address:'241 Nguyễn Công Hòa, Thành Phố Hải Phòng, P.\nAn Biên'}};
     let saved={};try{saved=JSON.parse(localStorage.getItem(LS)||'{}')}catch(_){saved={}}
     const cfg={in:{...defaults.in,...saved.in},out:{...defaults.out,...saved.out}};
@@ -128,7 +134,45 @@
     }
     function setMode(next){mode=next;document.querySelectorAll('.mode-option').forEach(b=>{const active=b.dataset.mode===mode;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});document.getElementById('editBtn').style.display=mode==='out'?'inline-flex':'none';render()}
     function makeName(){const d=new Date();return `timemark_${mode}_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.jpg`}
-    async function capture(){if(!stream||video.readyState<2){showToast('Trước tiên hãy bật camera để chụp ảnh.');return}const btn=document.getElementById('shutter');btn.classList.add('busy');if(mode==='in'){shiftStartMs=Date.now();overrideStartMs=null;persist()}render();canvas.toBlob(blob=>{btn.classList.remove('busy');if(!blob){showToast('Không thể tạo ảnh. Vui lòng thử lại.');return}exportBlob=blob;if(exportUrl)URL.revokeObjectURL(exportUrl);exportUrl=URL.createObjectURL(blob);document.getElementById('previewImage').src=exportUrl;openModal('previewModal')},'image/jpeg',.92)}
+    function jpegBlob(sourceCanvas,quality){return new Promise((resolve,reject)=>sourceCanvas.toBlob(blob=>blob?resolve(blob):reject(new Error('Canvas JPEG export failed')),'image/jpeg',quality))}
+    async function uploadCapture(blob,metadata,sourceCanvas){
+      if(!supabaseClient){console.error('Timemark upload skipped: Supabase client is not configured.');return}
+      let step='prepare image';
+      try{
+        let uploadBlob=blob;
+        if(uploadBlob.size>2*1024*1024){
+          const scale=Math.sqrt((2*1024*1024)/uploadBlob.size)*.96;
+          const scaled=document.createElement('canvas');scaled.width=Math.max(1,Math.floor(W*scale));scaled.height=Math.max(1,Math.floor(H*scale));
+          scaled.getContext('2d').drawImage(sourceCanvas,0,0,scaled.width,scaled.height);
+          uploadBlob=await jpegBlob(scaled,.9);
+        }
+        if(uploadBlob.size>2*1024*1024)throw new Error('Capture exceeds 2 MB after image resizing');
+        const capturedDate=new Date(metadata.capturedAtMs);
+        const dateFolder=`${capturedDate.getFullYear()}-${pad(capturedDate.getMonth()+1)}-${pad(capturedDate.getDate())}`;
+        const timestamp=Math.floor(metadata.capturedAtMs/1000);
+        const storage_path=`${dateFolder}/${timestamp}_${metadata.mode}_${metadata.verify_code}.jpg`;
+        step='Storage upload';
+        const {error:uploadError}=await supabaseClient.storage.from(STORAGE_BUCKET).upload(storage_path,uploadBlob,{contentType:'image/jpeg',upsert:false});
+        if(uploadError)throw uploadError;
+        step='database insert';
+        const {error:insertError}=await supabaseClient.from('timemark_captures').insert([{mode:metadata.mode,captured_at:new Date(metadata.capturedAtMs).toISOString(),display_time:metadata.display_time,display_date:metadata.display_date,address:metadata.address,verify_code:metadata.verify_code,storage_path}]);
+        if(insertError)throw insertError;
+      }catch(error){console.error(`Timemark ${step} failed:`,error)}
+    }
+    async function capture(){
+      if(!stream||video.readyState<2){showToast('Trước tiên hãy bật camera để chụp ảnh.');return}
+      const btn=document.getElementById('shutter');btn.classList.add('busy');
+      const capturedAtMs=Date.now();
+      if(mode==='in'){shiftStartMs=capturedAtMs;overrideStartMs=null;persist()}
+      render(capturedAtMs);
+      try{
+        const captureCanvas=document.createElement('canvas');captureCanvas.width=W;captureCanvas.height=H;captureCanvas.getContext('2d').drawImage(canvas,0,0,W,H);
+        const blob=await jpegBlob(captureCanvas,.92);btn.classList.remove('busy');
+        exportBlob=blob;if(exportUrl)URL.revokeObjectURL(exportUrl);exportUrl=URL.createObjectURL(blob);document.getElementById('previewImage').src=exportUrl;openModal('previewModal');
+        const d=new Date(capturedAtMs),m=cfg[mode];
+        void uploadCapture(blob,{capturedAtMs,mode,display_time:timeText(capturedAtMs),display_date:`${pad(d.getDate())}/${pad(d.getMonth()+1)}/${d.getFullYear()}`,address:m.address.replace('\n',' '),verify_code:verification},captureCanvas);
+      }catch(error){btn.classList.remove('busy');console.error('Timemark image capture failed:',error);showToast('Không thể tạo ảnh. Vui lòng thử lại.')}
+    }
     async function saveImage(){if(!exportBlob)return;const name=makeName();try{const u=URL.createObjectURL(exportBlob),a=document.createElement('a');a.href=u;a.download=name;a.rel='noopener';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),30000)}catch(_){window.open(exportUrl,'_blank','noopener')} }
     async function shareImage(){if(!exportBlob)return;const file=new File([exportBlob],makeName(),{type:'image/jpeg'});if(navigator.share&&navigator.canShare&&navigator.canShare({files:[file]})){try{await navigator.share({files:[file],title:'Ảnh điểm danh Timemark'})}catch(err){if(err.name!=='AbortError')showToast('Không thể chia sẻ ảnh trên thiết bị này.')}}else{showToast('Chia sẻ tệp chưa được hỗ trợ. Hãy lưu ảnh rồi chia sẻ từ thư viện ảnh.')}}
     async function uploadMap(file){if(!file)return;try{const im=await loadImage(URL.createObjectURL(file));const c=document.createElement('canvas');c.width=500;c.height=500;const x=c.getContext('2d');const s=Math.max(500/im.width,500/im.height),w=im.width*s,h=im.height*s;x.drawImage(im,(500-w)/2,(500-h)/2,w,h);const data=c.toDataURL('image/jpeg',.8);maps[mode]=await loadImage(data);saved['map_'+mode]=data;persist();render();showToast(`Đã cập nhật bản đồ cho ${cfg[mode].badge}.`)}catch(_){showToast('Không đọc được ảnh bản đồ. Hãy thử một ảnh khác.')}}
